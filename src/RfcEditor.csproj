@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework><UseWindowsForms>true</UseWindowsForms><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>RfcEditor</AssemblyName><Version>1.1.0</Version></PropertyGroup>
+  <ItemGroup><Reference Include="AssetsTools.NET"><HintPath>../lib/AssetsTools.NET.dll</HintPath></Reference><None Include="../lib/classdata.tpk" Link="classdata.tpk" CopyToOutputDirectory="PreserveNewest" /></ItemGroup>
+</Project>
