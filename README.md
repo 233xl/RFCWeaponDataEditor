@@ -10,8 +10,6 @@ Select a Projectile or Weapon and choose **Delete object**, or press Delete whil
 
 Projectiles still used by weapons cannot be deleted: assign those weapons to another projectile first. Other live object references, or assets whose references cannot be inspected safely, also block deletion. Reset cannot restore a weapon reference to a deleted projectile. To discard unsaved deletions, reopen the file; to restore a saved version, use its backup.
 
-Tests cover real intermediate compression progress, failed-save progress, unsaved/saved clone deletion, original projectile removal, weapon registration cleanup, reference protection, repeated saving, and backups. In-game behavior remains unverified.
-
 ## v1.3: clone projectiles and reassign weapons
 
 The left panel now has a Projectile tree with connecting lines. Each projectile contains the weapons that use it. Select any node to edit its parameters.
