@@ -6,6 +6,21 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        if(args.Length>0 && args[0]=="--delete-progress-test")
+        {
+            try { DeletionProgressTest.Run(args[1],args[2]); return 0; }
+            catch(Exception ex){Console.Error.WriteLine(ex);return 1;}
+        }
+        if(args.Length>0 && args[0]=="--graph-test")
+        {
+            try { ProjectileGraphTest.Run(args[1],args[2]); return 0; }
+            catch(Exception ex){Console.Error.WriteLine(ex);return 1;}
+        }
+        if(args.Length>0 && args[0]=="--compression-test")
+        {
+            try { CompressionTest.Run(args[1],args[2]); return 0; }
+            catch(Exception ex){Console.Error.WriteLine(ex);return 1;}
+        }
         if(args.Length>0 && args[0]=="--self-test")
         {
             try { SelfTest.Run(args[1],args[2]); return 0; }
@@ -14,6 +29,50 @@ static class Program
         ApplicationConfiguration.Initialize();
         Application.Run(new EditorForm(args.FirstOrDefault()));
         return 0;
+    }
+}
+
+static class CompressionTest
+{
+    public static void Run(string source,string directory)
+    {
+        Directory.CreateDirectory(directory);
+        byte[] originalHash=SHA256.HashData(File.ReadAllBytes(source));
+        foreach(var mode in new[]{SaveCompression.None,SaveCompression.LZ4,SaveCompression.LZMA})
+        {
+            using var doc=new BundleDocument(source);
+            doc.Compression=mode;
+            var damage=doc.Components.First(c=>c.Kind=="Projectile").Parameters.Single(p=>p.Path=="configuration.damage");
+            damage.Set("147.25");
+            string path=Path.Combine(directory,mode+".rfc");
+            var watch=System.Diagnostics.Stopwatch.StartNew();doc.SaveAs(path);watch.Stop();
+            var loadWatch=System.Diagnostics.Stopwatch.StartNew();
+            using var read=new BundleDocument(path);loadWatch.Stop();
+            if(read.SourceCompression!=doc.OutputCompression)throw new Exception("Wrong compression: "+mode);
+            if(read.Components.First(c=>c.Kind=="Projectile").Parameters.Single(p=>p.Path=="configuration.damage").Text!="147.25")throw new Exception("Lost damage: "+mode);
+            Console.WriteLine($"{mode}: {new FileInfo(path).Length} bytes; save+verify {watch.Elapsed.TotalSeconds:F2}s; editor reopen {loadWatch.Elapsed.TotalSeconds:F2}s");
+            // Auto must preserve compressed inputs and compress old uncompressed inputs.
+            string auto=Path.Combine(directory,mode+"-auto.rfc");read.SaveAs(auto);
+            using var autoDoc=new BundleDocument(auto);
+            var expected=mode==SaveCompression.LZMA?AssetsTools.NET.AssetBundleCompressionType.LZMA:AssetsTools.NET.AssetBundleCompressionType.LZ4;
+            if(autoDoc.SourceCompression!=expected)throw new Exception("Auto mode failed: "+mode);
+        }
+        string current=Path.Combine(directory,"inplace.rfc");File.Copy(Path.Combine(directory,"None.rfc"),current);
+        byte[] before=SHA256.HashData(File.ReadAllBytes(current));
+        using(var doc=new BundleDocument(current))
+        {
+            if(doc.ChangeCount!=0 || !doc.HasPendingChanges)throw new Exception("Compression-only save not detected");
+            string backup=doc.Save()??throw new Exception("Missing compression-only backup");
+            if(!before.SequenceEqual(SHA256.HashData(File.ReadAllBytes(backup))))throw new Exception("Compression backup mismatch");
+            if(doc.HasPendingChanges || doc.Save()!=null)throw new Exception("Saved compression state not cleared");
+            doc.Compression=SaveCompression.LZMA;
+            _=doc.Save()??throw new Exception("Compression-only LZMA save skipped");
+            using var check=new BundleDocument(current);
+            if(check.SourceCompression!=AssetsTools.NET.AssetBundleCompressionType.LZMA)throw new Exception("LZMA overwrite failed");
+        }
+        if(Directory.GetFiles(directory,"*.raw").Length!=0 || Directory.GetFiles(directory,"*.tmp").Length!=0)throw new Exception("Temporary files leaked");
+        if(!originalHash.SequenceEqual(SHA256.HashData(File.ReadAllBytes(source))))throw new Exception("Original file changed");
+        Console.WriteLine("PASS: None/LZ4/LZMA outputs; changed-field round trips; all asset/resource data verified; Auto preserves compressed inputs; compression-only overwrite/backup/no-op; original unchanged.");
     }
 }
 static class SelfTest

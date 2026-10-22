@@ -5,6 +5,8 @@ using System.Security.Cryptography;
 
 namespace RfcEditor;
 
+public enum SaveCompression { Auto, LZ4, LZMA, None }
+
 public sealed class Parameter
 {
     public required string Path { get; init; }
@@ -54,10 +56,22 @@ public sealed class Component
     public override string ToString() => $"{(Changed ? "● " : "")}{Kind}  ·  {Name}";
 }
 
-public sealed class BundleDocument : IDisposable
+public sealed partial class BundleDocument : IDisposable
 {
     public string Source { get; }
     public string UnityVersion { get; private set; } = "";
+    public AssetBundleCompressionType SourceCompression { get; private set; }
+    public SaveCompression Compression { get; set; } = SaveCompression.Auto;
+    public AssetBundleCompressionType OutputCompression => Compression switch
+    {
+        SaveCompression.LZ4 => AssetBundleCompressionType.LZ4,
+        SaveCompression.LZMA => AssetBundleCompressionType.LZMA,
+        SaveCompression.None => AssetBundleCompressionType.None,
+        _ => SourceCompression == AssetBundleCompressionType.None ? AssetBundleCompressionType.LZ4 : SourceCompression
+    };
+    public bool HasPendingChanges => ChangeCount > 0 || unsavedAdditions > 0 || unsavedDeletions > 0 || OutputCompression != SourceCompression;
+    public int PendingAdditions => unsavedAdditions;
+    public int PendingDeletions => unsavedDeletions;
     public List<Component> Components { get; } = new();
     public List<string> Diagnostics { get; } = new();
     readonly AssetsManager manager = new();
@@ -74,6 +88,12 @@ public sealed class BundleDocument : IDisposable
             // This also makes repeated overwrites independent of stale offsets.
             byte[] sourceBytes = File.ReadAllBytes(Source);
             sourceHash = SHA256.HashData(sourceBytes);
+            using(var headerReader=new AssetsFileReader(new MemoryStream(sourceBytes,false)))
+            {
+                var headerBundle=new AssetBundleFile();
+                headerBundle.Read(headerReader);
+                SourceCompression=headerBundle.GetCompressionType(headerBundle.BlockAndDirInfo.BlockInfos);
+            }
             bundle = manager.LoadBundleFile(new MemoryStream(sourceBytes, false), Source, true);
             for (int entry = 0; entry < bundle.file.BlockAndDirInfo.DirectoryInfos.Length; entry++)
             {
@@ -163,28 +183,32 @@ public sealed class BundleDocument : IDisposable
         }).Select(c=>c.Name).ToList();
         return users.Count>0 ? L10n.T("shared",string.Join(", ",users)) : L10n.T("noUsers");
     }
-    public void SaveAs(string destination)
+    public void SaveAs(string destination,IProgress<SaveProgress>? progress=null)
     {
         destination = Path.GetFullPath(destination);
         if(string.Equals(destination,Source,StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException(L10n.T("newName"));
         if(File.Exists(destination)) throw new IOException(L10n.T("exists"));
         string temp=destination+"."+Guid.NewGuid().ToString("N")+".tmp";
+        var reporter=new SaveProgressReporter(progress);
         try
         {
-            WriteVerified(temp);
+            WriteVerified(temp,reporter);
+            reporter.Report(SaveStage.Replacing,0);
             File.Move(temp,destination); // Never replace a pre-existing file.
+            reporter.Report(SaveStage.Complete,100);
         }
         finally { if(File.Exists(temp))File.Delete(temp); }
     }
-    public string? Save()
+    public string? Save(IProgress<SaveProgress>? progress=null)
     {
-        if(ChangeCount==0) return null;
+        if(!HasPendingChanges) return null;
         string temp=Source+"."+Guid.NewGuid().ToString("N")+".tmp";
         string backup=Source+"."+DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss-fff",CultureInfo.InvariantCulture)+"."+Guid.NewGuid().ToString("N")[..8]+".bak";
+        var reporter=new SaveProgressReporter(progress);
         try
         {
-            WriteVerified(temp);
+            WriteVerified(temp,reporter);
             byte[] nextHash;
             using(var staged=File.OpenRead(temp)) nextHash=SHA256.HashData(staged);
             // Deny concurrent writes while hashing and atomically replacing the file.
@@ -192,54 +216,106 @@ public sealed class BundleDocument : IDisposable
             using(var guard=new FileStream(Source,FileMode.Open,FileAccess.Read,FileShare.Read|FileShare.Delete))
             {
                 if(!sourceHash.SequenceEqual(SHA256.HashData(guard))) throw new IOException(L10n.T("externalChange"));
+                reporter.Report(SaveStage.Replacing,0);
                 File.Replace(temp,Source,backup);
             }
             sourceHash=nextHash;
+            SourceCompression=OutputCompression;
             foreach(var p in Components.SelectMany(c=>c.Parameters)) p.Original=p.Text;
+            unsavedAdditions=0;
+            unsavedNewIds.Clear();
+            unsavedDeletions=0;
+            reporter.Report(SaveStage.Complete,100);
             return backup;
         }
         finally { if(File.Exists(temp))File.Delete(temp); }
     }
-    void WriteVerified(string temp)
+    void WriteVerified(string temp,SaveProgressReporter progress)
     {
+            progress.Report(SaveStage.Writing,0);
             var replacements=new List<BundleReplacer>();
             foreach(var pair in files)
             {
-                var changed=Components.Where(c=>c.Entry==pair.Key && c.NeedsRewrite).ToList();
-                if(changed.Count==0) continue;
+                var added=addedAssets.Values.Where(a=>a.Entry==pair.Key).ToList();
+                var metadataEdits=editedAssets.Values.Where(a=>a.Entry==pair.Key).ToList();
+                var removed=removedAssets.Where(k=>k.Entry==pair.Key && pair.Value.file.GetAssetInfo(k.Id)!=null).ToList();
+                var changed=Components.Where(c=>c.Entry==pair.Key && c.NeedsRewrite && !addedAssets.ContainsKey((c.Entry,c.Info.PathId))).ToList();
+                if(changed.Count==0 && added.Count==0 && metadataEdits.Count==0 && removed.Count==0) continue;
                 var edits=changed.Select(c=>(AssetsReplacer)new AssetsReplacerFromMemory(pair.Value.file,c.Info,c.Root.WriteToByteArray(pair.Value.file.Reader.BigEndian))).ToList();
+                edits.AddRange(added.Select(a=>(AssetsReplacer)new AssetsReplacerFromMemory(a.Info.PathId,a.Info.TypeId,pair.Value.file.GetScriptIndex(a.Info),a.Root.WriteToByteArray(pair.Value.file.Reader.BigEndian))));
+                edits.AddRange(metadataEdits.Select(a=>(AssetsReplacer)new AssetsReplacerFromMemory(pair.Value.file,a.Info,a.Root.WriteToByteArray(pair.Value.file.Reader.BigEndian))));
+                edits.AddRange(removed.Select(k=>(AssetsReplacer)new AssetsRemover(k.Id)));
                 using var data=new MemoryStream();
                 using(var writer=new AssetsFileWriter(data)) pair.Value.file.Write(writer,0,edits);
                 string name=bundle.file.GetFileName(pair.Key);
                 replacements.Add(new BundleReplacerFromMemory(name,name,true,data.ToArray(),-1));
             }
-            using(var writer=new AssetsFileWriter(temp)) bundle.file.Write(writer,replacements);
-            Verify(temp);
+            string raw=temp+".raw";
+            try
+            {
+                using(var writer=new AssetsFileWriter(raw)) bundle.file.Write(writer,replacements);
+                progress.Report(SaveStage.Writing,100);
+                if(OutputCompression==AssetBundleCompressionType.None) File.Move(raw,temp);
+                else
+                {
+                    var unpacked=new AssetBundleFile();
+                    try
+                    {
+                        unpacked.Read(new AssetsFileReader(File.OpenRead(raw)));
+                        using var writer=new AssetsFileWriter(temp);
+                        progress.Report(SaveStage.Compressing,0);
+                        unpacked.Pack(unpacked.Reader,writer,OutputCompression,true,progress);
+                    }
+                    finally { unpacked.Close(); }
+                }
+                Verify(temp,progress);
+            }
+            finally { if(File.Exists(raw))File.Delete(raw); }
     }
-    void Verify(string path)
+    void Verify(string path,SaveProgressReporter progress)
     {
+        progress.Report(SaveStage.Verifying,0);
+        int total=files.Sum(f=>f.Value.file.AssetInfos.Count(a=>!removedAssets.Contains((f.Key,a.PathId))))+addedAssets.Count+bundle.file.BlockAndDirInfo.DirectoryInfos.Length-files.Count;
+        int completed=0;
+        void Advance()=>progress.Report(SaveStage.Verifying,++completed*100/Math.Max(1,total));
         var check=new AssetsManager();
         try
         {
-            var output=check.LoadBundleFile(path,true);
+            var output=check.LoadBundleFile(path,false);
+            if(output.file.GetCompressionType(output.file.BlockAndDirInfo.BlockInfos)!=OutputCompression)
+                throw new InvalidDataException(L10n.T("compressionMismatch"));
+            check.UnloadAll(true);
+            output=check.LoadBundleFile(path,true);
             if(!bundle.file.GetAllFileNames().SequenceEqual(output.file.GetAllFileNames()))throw new InvalidDataException(L10n.T("directoryChanged"));
             for(int i=0;i<bundle.file.BlockAndDirInfo.DirectoryInfos.Length;i++)
             {
                 if(files.TryGetValue(i,out var original))
                 {
                     var saved=check.LoadAssetsFileFromBundle(output,i,false);
-                    if(!original.file.AssetInfos.Select(a=>a.PathId).Order().SequenceEqual(saved.file.AssetInfos.Select(a=>a.PathId).Order()))throw new InvalidDataException(L10n.T("idsChanged"));
-                    var modified=Components.Where(c=>c.Entry==i && c.NeedsRewrite).ToDictionary(c=>c.Info.PathId);
+                    var added=addedAssets.Values.Where(a=>a.Entry==i).ToList();
+                    if(!original.file.AssetInfos.Where(a=>!removedAssets.Contains((i,a.PathId))).Select(a=>a.PathId).Concat(added.Select(a=>a.Info.PathId)).Order().SequenceEqual(saved.file.AssetInfos.Select(a=>a.PathId).Order()))throw new InvalidDataException(L10n.T("idsChanged"));
+                    var modified=Components.Where(c=>c.Entry==i && c.NeedsRewrite).ToDictionary(c=>c.Info.PathId,c=>c.Root);
+                    foreach(var edited in editedAssets.Values.Where(a=>a.Entry==i))modified[edited.Info.PathId]=edited.Root;
                     foreach(var info in original.file.AssetInfos)
                     {
-                        var expected=modified.TryGetValue(info.PathId,out var component) ? component.Root.WriteToByteArray(original.file.Reader.BigEndian) : Raw(original.file,info);
+                        if(removedAssets.Contains((i,info.PathId)))continue;
+                        var expected=modified.TryGetValue(info.PathId,out var componentRoot) ? componentRoot.WriteToByteArray(original.file.Reader.BigEndian) : Raw(original.file,info);
                         if(!expected.SequenceEqual(Raw(saved.file,saved.file.GetAssetInfo(info.PathId))))throw new InvalidDataException(L10n.T("dataMismatch",info.PathId));
+                        Advance();
+                    }
+                    foreach(var asset in added)
+                    {
+                        var info=saved.file.GetAssetInfo(asset.Info.PathId);
+                        if(info.TypeId!=asset.Info.TypeId || saved.file.GetScriptIndex(info)!=original.file.GetScriptIndex(asset.Info) || !asset.Root.WriteToByteArray(original.file.Reader.BigEndian).SequenceEqual(Raw(saved.file,info)))
+                            throw new InvalidDataException(L10n.T("dataMismatch",asset.Info.PathId));
+                        Advance();
                     }
                 }
-                else if(!EntryHash(bundle.file,i).SequenceEqual(EntryHash(output.file,i)))throw new InvalidDataException(L10n.T("streamsChanged"));
+                else {if(!EntryHash(bundle.file,i).SequenceEqual(EntryHash(output.file,i)))throw new InvalidDataException(L10n.T("streamsChanged"));Advance();}
             }
         }
         finally { check.UnloadAll(true); }
+        progress.Report(SaveStage.Verifying,100);
     }
     static byte[] EntryHash(AssetBundleFile file,int index)
     {
